@@ -86,7 +86,8 @@ this email — indistinguishable by design.
     { "id": "att_1", "name": "invoice.pdf", "type": "application/pdf", "size": 84213 }
   ],
 
-  // Present only when the user granted CONTENT. Body is ALWAYS masked.
+  // Present only when the user granted CONTENT (grade 'masked' or 'full').
+  // `masked` states the grade: true = PII redacted, false = raw body, verbatim.
   "body": "Hi — your invoice for $420.00 is attached. Reply to …@…",
   "masked": true,
 
@@ -103,8 +104,12 @@ Field notes — the load-bearing subtleties:
   the email by id.
 - **`attachments` absent ⇒ not granted** (or this email is out of content-scope), not
   "no files."
-- **`body` is always masked** (`masked: true`); there is no raw option, and raw text
-  is never stored by Thread.
+- **`body` is graded — always branch on `masked`, never assume.** Body access has three
+  grades, chosen by the user at mint time: *subject only* (no `body`, no `masked`),
+  *masked* (`masked: true`, PII redacted — the default), and *full* (`masked: false`,
+  the raw body verbatim). A `masked: false` body is the user's private mail with nothing
+  removed; handle it as such. Code that hardcodes "the body is redacted" is wrong on a
+  full grant.
 - **`labels` vs `mailboxLabels`:** the first is Thread's semantic classification (what
   the grant is written against); the second is the provider's own labels/folders/flags
   (inbox state). Don't cross the streams.
@@ -118,11 +123,40 @@ Field notes — the load-bearing subtleties:
 | 401 | `UNAUTHORIZED` / `NO_ACTIVE_GRANT` | Missing/invalid key, or grant revoked/expired | Stop; tell the user to check the key or re-run Connect. |
 | 403 | `FORBIDDEN` / `NO_ACTIVE_GRANT` | The grant doesn't cover this read | Don't retry as-is. |
 | 404 | `NOT_FOUND` | Out of scope OR nonexistent (indistinguishable) | Treat as "not available to me." |
-| 429 | rate limit | Daily cap reached | Back off; retry tomorrow / next window. |
+| 429 | `RATE_LIMITED` | Daily cap reached | Back off until `00:00Z`. Retrying sooner just burns calls. |
 | 503 | `PROVIDER_ERROR` | Transient engine/provider error | Retry later. |
 
 Out-of-scope mail on the **feed** is never an error — it's simply absent. The 403/404
 codes appear on **direct id fetches** and revoked/expired grants.
+
+---
+
+## Rate limit — what a call costs
+
+A grant *may* carry a `rate_limit_per_day`. It's optional (many grants have none) and
+you cannot read its value; you discover it by receiving `429`.
+
+What counts against it:
+
+- **Any call that succeeds counts as one unit** — the counter is over *allowed calls*,
+  not emails returned.
+- **A feed call that returns zero emails still counts.** Empty is normal, but it is
+  not free.
+- **Peeks count.** `?limit`/`?since`/`?cursor` spare your *watermark*, not your budget.
+- `GET /emails/{id}` and attachment downloads each count as their own call.
+- **Denied calls (401/403/404) do not count.** Only allows are charged.
+
+The window is a **UTC calendar day** — the counter resets at `00:00Z`, not 24 hours
+after your first call. On `429`, sleep to the next UTC midnight.
+
+Cadence, therefore: poll no faster than every **60s** (Thread's own mailbox poll
+interval — nothing newer exists before then), and if a daily limit is in play, keep
+your interval at or above `86400 / limit` seconds, leaving headroom for the id-fetches
+and attachment downloads you make between polls.
+
+There is **no push path for an API key.** Thread's webhook delivery is for registered
+third-party apps that have a callback URL; a `thread_sk_…` key has none, and nothing
+will ever be POSTed to you. Polling the feed is the only way to learn of new mail.
 
 ---
 
@@ -134,4 +168,7 @@ codes appear on **direct id fetches** and revoked/expired grants.
   retrievable by id even if later re-labeling would narrow it.
 - **Forward-only.** Thread watches mail from connection time on; it never backfills
   old mail.
-- **Raw content never leaves.** Bodies are masked or absent; there is no raw option.
+- **Content is graded, and the response states the grade.** A body is absent (subject
+  only), masked (`masked: true`), or raw (`masked: false`) — per the user's choice at
+  mint time. You never have to guess which you're holding; read `masked`.
+- **Pull, not push.** An API key has no callback; the feed is the only way in.

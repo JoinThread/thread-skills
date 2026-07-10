@@ -4,9 +4,11 @@ description: >-
   Read a user's email through Thread — a scoped, read-only mail feed for agents.
   Use this whenever you need to see the user's mail: triage an inbox, watch for
   new messages, pull a receipt or invoice, or download an attachment (a PDF, an
-  image). One API key, one endpoint to loop on. The key only ever returns the
-  mail the user granted, already filtered — you never see their whole inbox, and
-  you never handle a permission error, because out-of-scope mail is simply absent.
+  image). One API key, one endpoint you poll on a timer — there is no push, and
+  every call (even an empty one) counts against a daily limit, so cadence matters.
+  The key only ever returns the mail the user granted, already filtered — you never
+  see their whole inbox, and you never handle a permission error, because
+  out-of-scope mail is simply absent. Bodies are graded: absent, masked, or raw.
 ---
 
 # Thread mail
@@ -57,8 +59,9 @@ This is the only thing you must get right.
 
 > If you poll with the bare call and crash before handling the results, those
 > emails are already consumed — the next bare call won't return them. When in
-> doubt while developing, **peek with `?limit=`**; it's idempotent and safe to
-> repeat.
+> doubt while developing, **peek with `?limit=`**; it never moves your watermark,
+> so it's safe to repeat. (Safe for your *position* — it still costs a call against
+> the daily limit. See **Cadence and cost**.)
 
 Freshness: Thread ingests new mail within ~60s, and it is **forward-only** — it
 does not import mail that arrived before the mailbox was connected. If you're
@@ -79,7 +82,42 @@ Thread already filtered the feed to what the user allowed. So:
 
 The only errors you actually handle: `401` (bad/expired/revoked key — stop and tell
 the user to re-check the key or re-run Connect), `429` (daily rate limit — back
-off), `503` (transient upstream — retry later).
+off, see below), `503` (transient upstream — retry later).
+
+## Cadence and cost — how often to poll
+
+Mail does not arrive as a push to your key. **Polling the feed is the only way to
+see new mail**, so you own the cadence, and the cadence has a price.
+
+Three facts that decide it:
+
+1. **Nothing new can exist sooner than ~60s.** Thread polls the mailbox on its own
+   interval (60s by default) and classifies what it finds. Polling every 5s does not
+   get you mail 12× sooner — it gets you 12× the cost for the same mail.
+2. **Every successful call costs one unit of the daily limit — including a call that
+   returns zero emails.** The limit counts *allowed calls*, not emails delivered. An
+   empty feed response is a full-price call. So are peeks (`?limit=`), single fetches
+   (`GET /emails/{id}`), and attachment downloads. Only *denied* calls are free.
+3. **The user may have set that daily limit, and you can't read it.** It's optional —
+   many grants have none — but when it exists it's a number the user typed, invisible
+   to you until you hit `429`. Assume it's small.
+
+So: **poll no faster than once every 60 seconds.** If you learn the limit (the user
+tells you, or you hit `429` and count), keep your interval at or above
+`86400 / limit` seconds — a 100/day limit means one call every ~15 minutes, not one
+a minute. Budget for the fetches and downloads you make *in addition to* the poll.
+
+Do the work between polls, not more polls. One bare call hands you every new email
+at once; there is no reason to poll again until the next interval.
+
+**On `429`:** the window is a **UTC calendar day**, not a rolling 24 hours. Your
+budget resets at `00:00Z`, so back off until then — retrying in an hour just burns
+another call. Do not retry-storm; `429` is a fact about the grant, not a transient
+error, and no amount of retrying will change it before midnight UTC.
+
+If you need mail to arrive faster than a poll interval allows, that's a
+conversation with the user about their Thread setup — not something to solve by
+polling harder.
 
 ## Attachments — how to actually get a file
 
@@ -106,13 +144,30 @@ Three things that will trip you up if you don't read them:
 - **A 404 on the download** means the same as everywhere else: not granted, or gone.
   Don't retry it as if it were transient.
 
-## Message bodies
+## Message bodies — three grades, and you must read `masked`
 
-If the user granted message content, the email object includes `body` and
-`masked: true`. **The body is ALWAYS masked** — emails, phone numbers, cards, SSNs
-are redacted, and Thread never stores or serves the raw text. There is no raw
-option; don't look for one. If `body` is absent, the key wasn't granted content —
-work from `subject`, `from`, and `labels`.
+Body access is **graded**. The user picked one grade when they minted the key:
+
+| Grade          | You get                                  | `body`  | `masked` |
+|----------------|------------------------------------------|---------|----------|
+| **Subject only** | metadata: `from`, `subject`, `labels`  | absent  | absent   |
+| **Masked body**  | body with PII redacted (the default)   | present | `true`   |
+| **Full body**    | the raw body, verbatim                 | present | `false`  |
+
+**Never assume the body is redacted.** `masked` exists precisely so you don't have to
+guess — read it:
+
+- **`masked: true`** — emails, phone numbers, cards and SSNs have been redacted out.
+  Identifiers you need may simply not be there. Don't report a redacted string as if
+  it were a real account number.
+- **`masked: false`** — this is the **raw text of the user's private mail**, nothing
+  removed. Treat it accordingly: use it for the task at hand, don't log it, don't echo
+  it back wholesale, don't send it anywhere the user didn't ask you to.
+- **`body` absent** — the key is subject-only. Work from `subject`, `from`, and
+  `labels`, and don't report this as an error.
+
+Masked is the default grade, so a body you get is *most often* redacted — but "most
+often" is not "always", and the field is right there.
 
 ## Two kinds of labels — don't confuse them
 
@@ -128,19 +183,38 @@ work from `subject`, `from`, and `labels`.
 BASE="${THREAD_BASE_URL:-http://localhost:3002}"
 AUTH="Authorization: Bearer $THREAD_API_KEY"
 
-# Peek first while you develop — safe to repeat, never consumes.
+# Peek first while you develop — never consumes, so it's safe to repeat.
 curl -s -H "$AUTH" "$BASE/emails?limit=20" | jq '.emails[] | {id, from, subject, labels, attachments}'
 
 # The real loop — consumes: each call returns only what's new since the last.
-curl -s -H "$AUTH" "$BASE/emails" | jq
+# 60s is the floor; raise it if the grant has a daily limit (86400 / limit).
+while true; do
+  code=$(curl -s -o /tmp/feed.json -w '%{http_code}' -H "$AUTH" "$BASE/emails")
+  case "$code" in
+    200) jq -c '.emails[]' /tmp/feed.json | while read -r email; do
+           handle "$email"   # empty output is normal — nothing new in scope
+         done ;;
+    429) # Daily cap. Resets at 00:00 UTC — sleep to it, don't retry sooner.
+         sleep $(( $(date -u -d 'tomorrow 00:00' +%s 2>/dev/null \
+                  || date -u -v+1d -v0H -v0M -v0S +%s) - $(date -u +%s) )); continue ;;
+    401) echo "key invalid/revoked — stop, ask the user to re-check it"; exit 1 ;;
+    503) sleep 300; continue ;;   # transient upstream
+  esac
+  sleep 60
+done
 
-# Download a PDF you saw in the feed (bytes → file):
+# Download a PDF you saw in the feed (bytes → file). Costs a call, like any other.
 curl -s -H "$AUTH" "$BASE/emails/$ID/attachments/$ATTACHMENT_ID" -o invoice.pdf
 ```
 
 ## What this key can and can't do
 
-Read-only, metadata by default; body and attachments when granted. It **cannot**
+Read-only. You always get metadata; you get the body at whatever grade the user
+chose (masked by default, see above), and attachments when granted. It **cannot**
 send, reply, label, archive, delete, or change anything in the mailbox. If the user
 asks you to act on their mail, you can read to decide *what* to do, but the doing is
 outside this key.
+
+It also **cannot receive push**. There is no webhook, no callback, no long-poll for
+an API key — Thread's push delivery exists, but it's for registered third-party apps
+with a callback URL, not for the key you hold. Your loop is the mechanism.
