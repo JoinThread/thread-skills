@@ -41,11 +41,13 @@ Then give the agent two values:
 ## How Thread works, in one paragraph
 
 A user connects their mailbox to Thread once and mints a **scoped agent key** —
-choosing exactly which mail an agent may read (by category, sender, subject; with or
-without message bodies and attachments). The agent calls one endpoint, `GET /emails`,
-and gets back only the mail inside that grant, already filtered. Out-of-scope mail is
-simply absent — the agent never sees the rest of the inbox and never handles a
-permission error. Raw message bodies never leave Thread; bodies are masked or absent.
+choosing exactly which mail an agent may read (by category, sender, subject; and at
+what grade: subject only, a masked body with personal details redacted, or the full
+raw body). The agent polls one endpoint, `GET /emails`, on a timer — there is no push
+to an API key — and gets back only the mail inside that grant, already filtered.
+Out-of-scope mail is simply absent: the agent never sees the rest of the inbox and
+never handles a permission error. Every call counts against the grant's optional daily
+limit, even one that returns nothing, so the agent polls no faster than every 60s.
 
 ## Contributing
 
