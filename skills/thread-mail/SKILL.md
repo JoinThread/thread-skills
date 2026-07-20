@@ -207,6 +207,24 @@ done
 curl -s -H "$AUTH" "$BASE/emails/$ID/attachments/$ATTACHMENT_ID" -o invoice.pdf
 ```
 
+## Running the loop for real
+
+The loop above only monitors while it's running — and an agent's chat turn is not
+a place it can live. If you run it inline you'll either block the conversation or
+stop monitoring the moment the session ends, and it will look like "the skill
+doesn't show me emails." It does; nothing was running.
+
+Use whatever your runtime offers for **recurring execution**: a cron job or
+scheduled task that fires every N minutes, or your host's built-in loop/scheduler.
+Each scheduled run should do exactly one cycle: one bare `GET /emails`, handle
+what's new, notify the user if anything arrived, exit. The server-side watermark
+is your state — the next run picks up where this one left off, no cursor file
+needed.
+
+Pick N from **Cadence and cost**: 60 seconds is the floor, and if the grant has a
+daily limit, stay at or above `86400 / limit` seconds (a 100/day limit → every
+~15 minutes).
+
 ## What this key can and can't do
 
 Read-only. You always get metadata; you get the body at whatever grade the user
