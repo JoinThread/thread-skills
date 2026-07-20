@@ -214,16 +214,31 @@ a place it can live. If you run it inline you'll either block the conversation o
 stop monitoring the moment the session ends, and it will look like "the skill
 doesn't show me emails." It does; nothing was running.
 
-Use whatever your runtime offers for **recurring execution**: a cron job or
-scheduled task that fires every N minutes, or your host's built-in loop/scheduler.
-Each scheduled run should do exactly one cycle: one bare `GET /emails`, handle
-what's new, notify the user if anything arrived, exit. The server-side watermark
-is your state — the next run picks up where this one left off, no cursor file
-needed.
+**What one scheduled run does.** Exactly one cycle, then exit: one bare
+`GET /emails` → handle what came back → tell the user if anything arrived → done.
+Do not loop inside the run. The server-side watermark is your state, so the next
+run resumes exactly where this one stopped — no cursor file, no dedup store, no
+"last seen" timestamp to maintain.
 
-Pick N from **Cadence and cost**: 60 seconds is the floor, and if the grant has a
-daily limit, stay at or above `86400 / limit` seconds (a 100/day limit → every
-~15 minutes).
+**What to schedule it with**, in order of preference — take the first one your
+runtime actually has:
+
+1. **A host scheduler / cron tool** (Claude Code `CronCreate`, `crontab`, systemd
+   timer, Task Scheduler, a platform cron trigger). Prefer this always: it is the
+   only option that keeps running after the conversation ends, which is what
+   "watch my mail" nearly always means.
+2. **A host loop primitive** that re-invokes you on an interval (e.g. Claude Code
+   `/loop 15m`). Good when the user wants monitoring *for this session only* and
+   is sitting there watching.
+3. **Nothing available? Say so.** Do one poll, report what you found, and tell the
+   user plainly that you cannot keep watching without a scheduler. Do not silently
+   substitute an inline `while true` or a long `sleep` — that is the failure this
+   section exists to prevent.
+
+**Pick the interval** from **Cadence and cost**: 60 seconds is the hard floor, and
+if the grant has a daily limit, stay at or above `86400 / limit` seconds (a 100/day
+limit → every ~15 minutes). When you don't know the limit, **15 minutes is the safe
+default** — it survives a 100/day grant with headroom to spare.
 
 ## What this key can and can't do
 
