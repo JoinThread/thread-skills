@@ -207,6 +207,39 @@ done
 curl -s -H "$AUTH" "$BASE/emails/$ID/attachments/$ATTACHMENT_ID" -o invoice.pdf
 ```
 
+## Running the loop for real
+
+The loop above only monitors while it's running — and an agent's chat turn is not
+a place it can live. If you run it inline you'll either block the conversation or
+stop monitoring the moment the session ends, and it will look like "the skill
+doesn't show me emails." It does; nothing was running.
+
+**What one scheduled run does.** Exactly one cycle, then exit: one bare
+`GET /emails` → handle what came back → tell the user if anything arrived → done.
+Do not loop inside the run. The server-side watermark is your state, so the next
+run resumes exactly where this one stopped — no cursor file, no dedup store, no
+"last seen" timestamp to maintain.
+
+**What to schedule it with**, in order of preference — take the first one your
+runtime actually has:
+
+1. **A host scheduler / cron tool** (Claude Code `CronCreate`, `crontab`, systemd
+   timer, Task Scheduler, a platform cron trigger). Prefer this always: it is the
+   only option that keeps running after the conversation ends, which is what
+   "watch my mail" nearly always means.
+2. **A host loop primitive** that re-invokes you on an interval (e.g. Claude Code
+   `/loop 15m`). Good when the user wants monitoring *for this session only* and
+   is sitting there watching.
+3. **Nothing available? Say so.** Do one poll, report what you found, and tell the
+   user plainly that you cannot keep watching without a scheduler. Do not silently
+   substitute an inline `while true` or a long `sleep` — that is the failure this
+   section exists to prevent.
+
+**Pick the interval** from **Cadence and cost**: 60 seconds is the hard floor, and
+if the grant has a daily limit, stay at or above `86400 / limit` seconds (a 100/day
+limit → every ~15 minutes). When you don't know the limit, **15 minutes is the safe
+default** — it survives a 100/day grant with headroom to spare.
+
 ## What this key can and can't do
 
 Read-only. You always get metadata; you get the body at whatever grade the user
