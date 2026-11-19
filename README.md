@@ -1,7 +1,7 @@
 # Thread skills
 
 Open-source [agent skills](https://agentskills.io) for [Thread](https://jointhread.com) —
-the scoped, read-only mail feed for AI agents. Install a skill and your agent knows
+the scoped, read-only mail feed for AI agents. The feed includes the message text whenever the user allowed it. Install a skill and your agent knows
 how to read a user's email through Thread: one API key, one endpoint to loop on, and
 it only ever sees the mail the user granted.
 
@@ -33,10 +33,18 @@ git clone https://github.com/jointhread/thread-skills
 cp -r thread-skills/skills/thread-mail ~/.claude/skills/
 ```
 
-Then give the agent two values:
+Then give the agent one value:
 
-- `THREAD_API_KEY` — mint one at your Thread dashboard → **Agent keys**. Looks like `thread_sk_…`.
-- `THREAD_BASE_URL` — your Thread gateway host (`http://localhost:3002` in dev).
+- `THREAD_API_KEY`: create one at your Thread dashboard, **Agent keys**. Looks like `thread_sk_...`.
+
+`THREAD_BASE_URL` is optional and defaults to `https://gw.thread.xyz`.
+
+No skills directory? The official CLI needs no install and prints the full message text:
+
+```bash
+npx @jointhread/mail me      # what this key can read
+npx @jointhread/mail new     # everything new, text included
+```
 
 ## How Thread works, in one paragraph
 
