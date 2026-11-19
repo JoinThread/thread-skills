@@ -1,21 +1,24 @@
 ---
 name: thread-mail
 description: >-
-  Read a user's email through Thread, a scoped, read-only mail feed for agents.
-  Use this whenever you need to see the user's mail: triage an inbox, watch for
-  new messages, find what someone is asking, pull a receipt or invoice, or
-  download an attachment. One API key, three calls. The feed includes the full
-  message text whenever the user allowed it; call GET /me first and it tells you
-  exactly what you have. You only ever see the mail the user granted, already
-  filtered, so there is no permission error to handle: out-of-scope mail is absent.
+  Read a user's email through Thread, a scoped mail feed for agents, and, when the
+  user allowed it, draft or send replies. Use this whenever you need to see the
+  user's mail: triage an inbox, watch for new messages, find what someone is asking,
+  pull a receipt or invoice, download an attachment, or answer an email on their
+  behalf. One API key, a handful of calls. The feed includes the full message text
+  whenever the user allowed it; call GET /me first and it tells you exactly what you
+  have, including whether you may draft or send. You only ever see the mail the user
+  granted, already filtered, so there is no permission error to handle: out-of-scope
+  mail is absent.
 ---
 
 # Thread mail
 
-You have a **Thread API key**. It gives you a scoped, read-only view of one user's
-mailbox. The user chose the scope once, when they created the key: which categories
-of mail, and how much of each email (subject only, text with personal details masked,
-or full text). Your job is to ask for mail and use what comes back.
+You have a **Thread API key**. It gives you a scoped view of one user's mailbox. The
+user chose the scope once, when they created the key: which categories of mail, how
+much of each email (subject only, text with personal details masked, or full text), and
+whether you may write drafts or send replies. Your job is to ask for mail, use what
+comes back, and write only what the key allows.
 
 ## Setup
 
@@ -56,24 +59,30 @@ curl -s -H "Authorization: Bearer $THREAD_API_KEY" https://gw.thread.xyz/me
   "dailyLimit": null,                               // calls per UTC day, or null
   "expiresAt": "2027-02-17T00:00:00.000Z",
   "calendar": [],
+  "send": null,                                     // or a policy object; see "Replying and sending"
   "feed": { "endpoint": "/emails", "singleEmail": "/emails/{id}", "attachment": "...", "firstCall": "..." }
 }
 ```
 
-`bodyGrade` is the one field to remember. It tells you what `body` will hold on every
-email before you fetch anything. `/me` discloses no mail and is free: it never counts
-against the daily limit, so you can call it whenever you are unsure.
+`bodyGrade` is the one field to remember for reading. It tells you what `body` will hold
+on every email before you fetch anything. `send` is the one field to remember for writing:
+`null` means read only. `/me` discloses no mail and is free: it never counts against the
+daily limit, so you can call it whenever you are unsure.
 
 ## The whole API
 
-Three calls, plus attachments. That is the entire surface.
+Reading is three calls, plus attachments. Writing is three more, and most keys are not
+allowed any of them.
 
 ```
-GET  {BASE}/me                              what this key can read
+GET  {BASE}/me                              what this key can read and do
 GET  {BASE}/emails                          everything NEW since your last call (the loop)
 GET  {BASE}/emails?limit=20                 a peek at the last 20 in-scope emails
 GET  {BASE}/emails/{id}                     one email by id
 GET  {BASE}/emails/{id}/attachments/{aid}   one attachment's bytes
+POST {BASE}/emails/{id}/reply               reply in a thread you can read (if /me.send allows)
+POST {BASE}/emails                          a new email (only if /me.send.replyOnly is false)
+POST {BASE}/drafts                          a draft for the user to send (if /me.send is not null)
 Authorization: Bearer {THREAD_API_KEY}
 ```
 
@@ -229,12 +238,64 @@ curl -s -H "$AUTH" "$BASE/emails/$ID" | jq -r '.body'
 curl -s -H "$AUTH" "$BASE/emails/$ID/attachments/$ATTACHMENT_ID" -o invoice.pdf
 ```
 
+## Replying and sending
+
+Writing is a separate permission, off by default. `GET /me` tells you where you stand in
+its `send` field:
+
+```jsonc
+"send": {
+  "mode": "drafts_only",                 // or "send"
+  "replyOnly": true,                     // false: POST /emails may start new emails
+  "newRecipients": false,                // true: a reply may cc people who were not on the thread
+  "dailySendCap": null,                  // sends per UTC day, or null; drafts never count
+  "recipientsFromAllowedCategoriesOnly": true,
+  "mailboxEnabled": true,                // false: the user has not turned sending on for the mailbox yet
+  "routes": { "reply": "POST /emails/{id}/reply", "newEmail": "POST /emails", "draft": "POST /drafts" },
+  "howTo": "..."                         // the same rules in a sentence
+}
+```
+
+- **`send: null`**: read only. You cannot draft or send. If the user asks you to answer an
+  email, write the reply text in chat and say sending is outside this key.
+- **`mode: "drafts_only"`**: you write, the user sends. `POST /emails/{id}/reply` with
+  `{ "body": "...", "draft": true }` (or `POST /drafts` with `{ "inReplyTo": id, "body": "..." }`)
+  puts a threaded reply in the user's Drafts folder. Plain `POST /emails/{id}/reply` is
+  refused with `403 SEND_NOT_GRANTED`.
+- **`mode: "send"`**: `POST /emails/{id}/reply` with `{ "body": "..." }` sends the reply from
+  the user's own address, inside the original thread. Add `"replyAll": true` to answer
+  everyone on the thread, `"cc": [...]` for extra people (needs `newRecipients`).
+- **`mailboxEnabled: false`**: every draft and send answers `501` until the user turns
+  sending on for the mailbox in their Thread portal under Connections. Tell them that; do
+  not retry.
+
+Rules that hold regardless of mode:
+
+- **You can only reply to mail you can read.** The original must be in the key's scope;
+  an out-of-scope id is `404`, exactly like a read.
+- **Plain text only.** What you put in `body` is exactly what is sent. No HTML, no
+  attachments on outbound mail in this version.
+- **Show the user the text before you send.** Sending is irreversible and goes out under
+  their name. The sensible default is to draft (or paste the text in chat), get a yes,
+  then send.
+- **Skip your own mail.** A reply you sent comes back through the feed a minute later
+  flagged `"sentByAgent": true`. Never treat it as new inbound mail or answer it.
+- Policy refusals are `403` with a code that says why: `SEND_NOT_GRANTED`,
+  `POLICY_REPLY_ONLY`, `POLICY_NEW_RECIPIENTS`, `POLICY_UNKNOWN_RECIPIENT`. A send cap is
+  `429 SEND_LIMIT_REACHED` (resets at 00:00 UTC). None of these are transient; do not retry
+  them, explain them.
+
+```bash
+# Reply (sends when /me.send.mode is "send"; add "draft": true to save instead)
+curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  "$BASE/emails/$ID/reply" -d '{"body":"Thursday at 3 works for me.\n\nParag"}'
+# → { "id": "…", "threadId": "…", "status": "sent" }      (or "drafted")
+```
+
 ## What this key can and can't do
 
-Read-only. You always get metadata; you get the text at whatever grade the user chose,
-and attachments when granted. It **cannot** send, reply, label, archive, delete, or change
-anything in the mailbox. If the user asks you to act on their mail, read to decide what to
-do, draft the reply for them, and say that sending is outside this key.
-
-It also **cannot receive push.** No webhook, no callback. Your scheduled poll is the
+You always get metadata; you get the text at whatever grade the user chose, and attachments
+when granted. Drafting and sending exist only when `/me.send` says so, and only as far as it
+says. The key can **never** label, archive, delete, or change anything already in the
+mailbox, and it cannot receive push: no webhook, no callback. Your scheduled poll is the
 mechanism.
