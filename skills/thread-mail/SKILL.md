@@ -1,220 +1,301 @@
 ---
 name: thread-mail
 description: >-
-  Read a user's email through Thread — a scoped, read-only mail feed for agents.
-  Use this whenever you need to see the user's mail: triage an inbox, watch for
-  new messages, pull a receipt or invoice, or download an attachment (a PDF, an
-  image). One API key, one endpoint you poll on a timer — there is no push, and
-  every call (even an empty one) counts against a daily limit, so cadence matters.
-  The key only ever returns the mail the user granted, already filtered — you never
-  see their whole inbox, and you never handle a permission error, because
-  out-of-scope mail is simply absent. Bodies are graded: absent, masked, or raw.
+  Read a user's email through Thread, a scoped mail feed for agents, and, when the
+  user allowed it, draft or send replies. Use this whenever you need to see the
+  user's mail: triage an inbox, watch for new messages, find what someone is asking,
+  pull a receipt or invoice, download an attachment, or answer an email on their
+  behalf. One API key, a handful of calls. The feed includes the full message text
+  whenever the user allowed it; call GET /me first and it tells you exactly what you
+  have, including whether you may draft or send. You only ever see the mail the user
+  granted, already filtered, so there is no permission error to handle: out-of-scope
+  mail is absent.
 ---
 
 # Thread mail
 
-You have a **Thread API key**. It gives you a scoped, read-only view of one user's
-mailbox. You did not choose the scope — the user did, once, when they minted the
-key. Your job is to ask for mail and use what comes back. Everything about
-filtering, classification, and privacy is Thread's job, invisible to you.
+You have a **Thread API key**. It gives you a scoped view of one user's mailbox. The
+user chose the scope once, when they created the key: which categories of mail, how
+much of each email (subject only, text with personal details masked, or full text), and
+whether you may write drafts or send replies. Your job is to ask for mail, use what
+comes back, and write only what the key allows.
 
 ## Setup
 
-Two values, both from the user:
+One value from the user, read from the environment, never printed, never committed:
 
-- `THREAD_API_KEY` — looks like `thread_sk_…`. Send it as `Authorization: Bearer <key>`.
-- `THREAD_BASE_URL` — the gateway base. Defaults to `http://localhost:3002` in dev.
-  In production the user gives you the real host.
+- `THREAD_API_KEY`, looks like `thread_sk_...`. Send it as `Authorization: Bearer <key>`.
+- `THREAD_BASE_URL` is optional and defaults to `https://gw.thread.xyz`.
 
-Never print the key, never write it into a file you commit, never paste it into a
-prompt. Read it from the environment.
+The quickest way to use the key is the official CLI, which needs no install step:
+
+```bash
+npx @jointhread/mail me              # what this key can read. Run this first.
+npx @jointhread/mail new             # everything new since your last `new`, text included
+npx @jointhread/mail peek 20         # the last 20 in-scope emails, without moving your position
+npx @jointhread/mail read <id>       # one email with its full text
+npx @jointhread/mail attachment <id> <attachmentId> [file]
+```
+
+Add `--json` to any command for the raw response. Prefer the CLI over writing your own
+client: every hand-written client we have seen dropped the `body` field and concluded
+Thread was "metadata only". It is not.
+
+## Step one, always: find out what you have
+
+```bash
+curl -s -H "Authorization: Bearer $THREAD_API_KEY" https://gw.thread.xyz/me
+```
+
+```jsonc
+{
+  "mailbox": "you@example.com",
+  "provider": "gmail",
+  "keyName": "claude-code",
+  "categories": ["financial", "travel", "work"],   // or "all"
+  "narrowedBy": [],                                 // e.g. ["advanced"] when a sender/subject rule narrows it
+  "bodyGrade": "masked",                            // "subject_only" | "masked" | "full"
+  "attachments": true,
+  "dailyLimit": null,                               // calls per UTC day, or null
+  "expiresAt": "2027-02-17T00:00:00.000Z",
+  "calendar": [],
+  "send": null,                                     // or a policy object; see "Replying and sending"
+  "feed": { "endpoint": "/emails", "singleEmail": "/emails/{id}", "attachment": "...", "firstCall": "..." }
+}
+```
+
+`bodyGrade` is the one field to remember for reading. It tells you what `body` will hold
+on every email before you fetch anything. `send` is the one field to remember for writing:
+`null` means read only. `/me` discloses no mail and is free: it never counts against the
+daily limit, so you can call it whenever you are unsure.
 
 ## The whole API
 
-Four calls. That's the entire surface.
+Reading is three calls, plus attachments. Writing is three more, and most keys are not
+allowed any of them.
 
 ```
-GET  {BASE}/emails                         → everything NEW since your last call (the loop)
-GET  {BASE}/emails?limit=20                → a peek at the last 20 in-scope emails
-GET  {BASE}/emails/{id}                     → one email by id
-GET  {BASE}/emails/{id}/attachments/{aid}   → download one attachment's bytes
+GET  {BASE}/me                              what this key can read and do
+GET  {BASE}/emails                          everything NEW since your last call (the loop)
+GET  {BASE}/emails?limit=20                 a peek at the last 20 in-scope emails
+GET  {BASE}/emails/{id}                     one email by id
+GET  {BASE}/emails/{id}/attachments/{aid}   one attachment's bytes
+POST {BASE}/emails/{id}/reply               reply in a thread you can read (if /me.send allows)
+POST {BASE}/emails                          a new email (only if /me.send.replyOnly is false)
+POST {BASE}/drafts                          a draft for the user to send (if /me.send is not null)
 Authorization: Bearer {THREAD_API_KEY}
 ```
 
-Full field-by-field contract: **[references/api.md](references/api.md)**. Read it
-before you write parsing code — the response shape has a few deliberate subtleties
-(below) that will bite you if you guess.
+Field-by-field contract: **[references/api.md](references/api.md)**. Read it before you
+write parsing code.
+
+## The message text is in the feed
+
+Every email object carries `body` when the user granted text. Three states, each
+distinguishable without guessing:
+
+| `body` | `bodyGrade` | Meaning |
+|---|---|---|
+| a string | `masked` or `full` | The text, at the granted grade. `masked: true` means personal details were redacted. |
+| `null` | `subject_only` | This key was never granted text. Work from `subject`, `from`, `labels`. Do not report it as an error. |
+| absent | absent | The key has text access, but this one email is outside its text scope. |
+
+Do not print only the subject and call it a summary. If the user asks "what is this email
+about" or "what are they asking me", read `body` (or `GET /emails/{id}`) and answer from
+the text. If `masked: true`, identifiers like `[redacted-phone]` are placeholders; never
+report one as a real number.
+
+`masked: false` is the user's private mail with nothing removed. Use it for the task at
+hand, do not log it, do not echo it back wholesale, do not send it anywhere the user did
+not ask you to.
 
 ## The one mental model: consume vs peek
 
-This is the only thing you must get right.
-
-- **Bare `GET /emails` CONSUMES.** It returns everything new since *your key's last
-  bare call*, then advances a server-side watermark. Call it again and those same
-  emails are gone from the response — you've already seen them. This is your **loop**:
-  poll it, handle what's new, poll again.
+- **Bare `GET /emails` CONSUMES.** It returns everything new since *your key's last bare
+  call*, then moves a server-side position forward. Call it again and those same emails
+  are gone from the response. This is your loop: poll, handle what is new, poll again.
+  Save each batch before you act on it.
 - **Any parameter (`?limit`, `?since`, `?cursor`) is a PEEK.** It never moves the
-  watermark. Use peeks for backfill, catch-up, "show me recent mail", or just
-  looking around without spending your position.
+  position. Use peeks for catch-up, "show me recent mail", or looking around while you
+  develop. Safe to repeat. Still costs a call against the daily limit.
 
-> If you poll with the bare call and crash before handling the results, those
-> emails are already consumed — the next bare call won't return them. When in
-> doubt while developing, **peek with `?limit=`**; it never moves your watermark,
-> so it's safe to repeat. (Safe for your *position* — it still costs a call against
-> the daily limit. See **Cadence and cost**.)
-
-Freshness: Thread ingests new mail within ~60s, and it is **forward-only** — it
-does not import mail that arrived before the mailbox was connected. If you're
-testing, send a *new* email and wait a minute; old mail will never appear.
+**First call:** right after a mailbox is connected, the feed returns the user's 50 most
+recent in-scope emails, read or unread, so you have something to work with on day one.
+After that, only what is new. Thread ingests new mail within about 60 seconds.
 
 ## Absence is not an error
 
 Thread already filtered the feed to what the user allowed. So:
 
-- An **empty `emails` array is normal.** It means nothing new is in your scope. It
-  does **not** mean the API is broken. Never retry-storm or alarm on it.
-- **Out-of-scope mail is simply missing** from the feed — there is no per-email
-  "denied". You will never see mail you weren't granted, and you never write code
-  to handle a rejection for it.
-- **`GET /emails/{id}` returns 404 when the email is out of scope OR doesn't exist
-  — the two are indistinguishable by design.** Treat 404 as "not available to me,"
-  full stop. Don't infer the email exists.
+- An **empty `emails` array is normal.** Nothing new is in scope. Never retry-storm or
+  alarm on it.
+- **Out-of-scope mail is simply missing.** There is no per-email "denied".
+- **`GET /emails/{id}` returns 404 when the email is out of scope OR does not exist.** The
+  two are indistinguishable by design. Treat 404 as "not available to me".
 
-The only errors you actually handle: `401` (bad/expired/revoked key — stop and tell
-the user to re-check the key or re-run Connect), `429` (daily rate limit — back
-off, see below), `503` (transient upstream — retry later).
+The only errors you handle: `401` (bad, expired or revoked key: stop and tell the user to
+check it in their dashboard), `429` (daily limit: back off, see below), `503` (transient:
+retry later).
 
-## Cadence and cost — how often to poll
+## Cadence and cost
 
-Mail does not arrive as a push to your key. **Polling the feed is the only way to
-see new mail**, so you own the cadence, and the cadence has a price.
+Mail does not arrive as a push. Polling the feed is the only way to see new mail, so you
+own the cadence, and the cadence has a price.
 
-Three facts that decide it:
+1. **Nothing new can exist sooner than about 60 seconds.** Thread polls the mailbox on its
+   own interval. Polling every 5 seconds gets you the same mail 12 times the cost.
+2. **Every successful call counts one unit against the daily limit, including a call that
+   returns zero emails.** Peeks, single fetches and attachment downloads count too. Denied
+   calls and `GET /me` do not.
+3. **The daily limit, if any, is in `/me` as `dailyLimit`.** You no longer have to discover
+   it by hitting 429.
 
-1. **Nothing new can exist sooner than ~60s.** Thread polls the mailbox on its own
-   interval (60s by default) and classifies what it finds. Polling every 5s does not
-   get you mail 12× sooner — it gets you 12× the cost for the same mail.
-2. **Every successful call costs one unit of the daily limit — including a call that
-   returns zero emails.** The limit counts *allowed calls*, not emails delivered. An
-   empty feed response is a full-price call. So are peeks (`?limit=`), single fetches
-   (`GET /emails/{id}`), and attachment downloads. Only *denied* calls are free.
-3. **The user may have set that daily limit, and you can't read it.** It's optional —
-   many grants have none — but when it exists it's a number the user typed, invisible
-   to you until you hit `429`. Assume it's small.
+So: poll no faster than once every 60 seconds. With a daily limit, keep your interval at
+or above `86400 / dailyLimit` seconds (100 a day means one call every 15 minutes), and
+leave room for the single-email reads you make between polls.
 
-So: **poll no faster than once every 60 seconds.** If you learn the limit (the user
-tells you, or you hit `429` and count), keep your interval at or above
-`86400 / limit` seconds — a 100/day limit means one call every ~15 minutes, not one
-a minute. Budget for the fetches and downloads you make *in addition to* the poll.
+**On `429`:** the window is a UTC calendar day. Your budget resets at `00:00Z`, so back off
+until then. Retrying in an hour just burns another call.
 
-Do the work between polls, not more polls. One bare call hands you every new email
-at once; there is no reason to poll again until the next interval.
+## Running the loop for real
 
-**On `429`:** the window is a **UTC calendar day**, not a rolling 24 hours. Your
-budget resets at `00:00Z`, so back off until then — retrying in an hour just burns
-another call. Do not retry-storm; `429` is a fact about the grant, not a transient
-error, and no amount of retrying will change it before midnight UTC.
+The loop only watches while it is running, and a chat turn is not a place it can live.
+Run it inline and you either block the conversation or stop watching when the session
+ends, and it looks like "the skill doesn't show me emails". It does; nothing was running.
 
-If you need mail to arrive faster than a poll interval allows, that's a
-conversation with the user about their Thread setup — not something to solve by
-polling harder.
+**What one scheduled run does.** Exactly one cycle, then exit: one bare `GET /emails`
+(or `npx @jointhread/mail new`), handle what came back, tell the user if anything
+arrived, done. The server-side position is your state: the next run resumes where this
+one stopped. No cursor file, no dedup store.
 
-## Attachments — how to actually get a file
+**What to schedule it with**, in order. Take the first one your runtime has:
 
-Two steps. There is **no "list attachments" call**; the handles come to you in the
-feed.
+1. **A host scheduler or cron tool** (Claude Code `CronCreate`, `crontab`, a systemd timer,
+   a platform cron trigger). The only option that keeps running after the conversation
+   ends, which is what "watch my mail" nearly always means.
+2. **A host loop primitive** that re-invokes you on an interval (Claude Code `/loop 15m`).
+   Good for this session only, with the user watching.
+3. **Nothing available? Say so.** Do one poll, report, and tell the user plainly that you
+   cannot keep watching without a scheduler. Do not substitute an inline `while true` or a
+   long `sleep`.
 
-1. **Discover.** Each email object may carry an `attachments` array:
-   `[{ id, name, type, size }]`. If it's present, those are downloadable handles.
-2. **Download.** `GET /emails/{id}/attachments/{attachmentId}` returns the **raw
-   bytes** (not JSON) with a `Content-Type` and a `Content-Disposition` filename.
-   Save or process the bytes directly.
+**Pick the interval** from the cadence rules above. When you do not know the limit, 15
+minutes is the safe default.
 
-Three things that will trip you up if you don't read them:
+## Attachments
 
-- **`hasAttachment` can be ABSENT — that means "unknown," not "no."** Some providers
-  (Gmail on a metadata-only grant) don't reveal attachments without a content fetch,
-  so Thread omits the field rather than lie with `false`. **Never branch on
-  `if (email.hasAttachment)`** to decide whether to look — an email with a real PDF
-  can have no `hasAttachment` field at all. Check for the `attachments` array
-  instead, or fetch the single email by id.
-- **`attachments` is present only if the key was granted attachment scope.** If it's
-  absent, either the grant doesn't include attachments or this email is out of
-  content-scope. Degrade gracefully — don't treat its absence as an error.
-- **A 404 on the download** means the same as everywhere else: not granted, or gone.
-  Don't retry it as if it were transient.
+There is no "list attachments" call; the handles come in the feed.
 
-## Message bodies — three grades, and you must read `masked`
+1. **Discover.** An email object may carry `attachments: [{ id, name, type, size }]`.
+2. **Download.** `GET /emails/{id}/attachments/{attachmentId}` returns the raw bytes with
+   a `Content-Type` and a `Content-Disposition` filename.
 
-Body access is **graded**. The user picked one grade when they minted the key:
+Two things that will trip you up:
 
-| Grade          | You get                                  | `body`  | `masked` |
-|----------------|------------------------------------------|---------|----------|
-| **Subject only** | metadata: `from`, `subject`, `labels`  | absent  | absent   |
-| **Masked body**  | body with PII redacted (the default)   | present | `true`   |
-| **Full body**    | the raw body, verbatim                 | present | `false`  |
+- **`hasAttachment` can be ABSENT, which means unknown, not no.** Gmail does not reveal
+  attachments on a metadata-only grant. Never branch on `if (email.hasAttachment)`;
+  check for the `attachments` array, or fetch the email by id.
+- **`attachments` is present only if the key was granted attachment access** (`/me` says).
+  Absent means not granted or out of scope for this email, not "no files".
 
-**Never assume the body is redacted.** `masked` exists precisely so you don't have to
-guess — read it:
+## Two kinds of labels
 
-- **`masked: true`** — emails, phone numbers, cards and SSNs have been redacted out.
-  Identifiers you need may simply not be there. Don't report a redacted string as if
-  it were a real account number.
-- **`masked: false`** — this is the **raw text of the user's private mail**, nothing
-  removed. Treat it accordingly: use it for the task at hand, don't log it, don't echo
-  it back wholesale, don't send it anywhere the user didn't ask you to.
-- **`body` absent** — the key is subject-only. Work from `subject`, `from`, and
-  `labels`, and don't report this as an error.
+- `labels`: **Thread's** labels, e.g. `["financial", "invoice"]`. What the user's grant is
+  written against. Reason about *what a message is* with these.
+- `mailboxLabels`: the **mailbox's own** labels, verbatim (Gmail `INBOX`, `UNREAD`,
+  `CATEGORY_*`; Outlook categories and folder; IMAP folder and flags). Reason about
+  *inbox state* with these, or with the `isUnread` boolean.
 
-Masked is the default grade, so a body you get is *most often* redacted — but "most
-often" is not "always", and the field is right there.
-
-## Two kinds of labels — don't confuse them
-
-- `labels` — **Thread's** semantic labels, e.g. `["financial","invoice"]`. This is
-  what the user's grant is written against. Reason about *what a message is* with these.
-- `mailboxLabels` — the **mailbox's own** labels, verbatim (Gmail `INBOX`/`UNREAD`/
-  `CATEGORY_*`, Outlook categories + folder, IMAP folder + flags). Reason about *inbox
-  state* — is it unread, starred, in the inbox — with these (or the `isUnread` boolean).
-
-## A minimal loop
+## A minimal loop without the CLI
 
 ```bash
-BASE="${THREAD_BASE_URL:-http://localhost:3002}"
+BASE="${THREAD_BASE_URL:-https://gw.thread.xyz}"
 AUTH="Authorization: Bearer $THREAD_API_KEY"
 
-# Peek first while you develop — never consumes, so it's safe to repeat.
-curl -s -H "$AUTH" "$BASE/emails?limit=20" | jq '.emails[] | {id, from, subject, labels, attachments}'
+# First: what do I have?
+curl -s -H "$AUTH" "$BASE/me" | jq '{mailbox, categories, bodyGrade, attachments, dailyLimit}'
 
-# The real loop — consumes: each call returns only what's new since the last.
-# 60s is the floor; raise it if the grant has a daily limit (86400 / limit).
-while true; do
-  code=$(curl -s -o /tmp/feed.json -w '%{http_code}' -H "$AUTH" "$BASE/emails")
-  case "$code" in
-    200) jq -c '.emails[]' /tmp/feed.json | while read -r email; do
-           handle "$email"   # empty output is normal — nothing new in scope
-         done ;;
-    429) # Daily cap. Resets at 00:00 UTC — sleep to it, don't retry sooner.
-         sleep $(( $(date -u -d 'tomorrow 00:00' +%s 2>/dev/null \
-                  || date -u -v+1d -v0H -v0M -v0S +%s) - $(date -u +%s) )); continue ;;
-    401) echo "key invalid/revoked — stop, ask the user to re-check it"; exit 1 ;;
-    503) sleep 300; continue ;;   # transient upstream
-  esac
-  sleep 60
-done
+# Peek while you develop. Never consumes, so it is safe to repeat. Print the text too.
+curl -s -H "$AUTH" "$BASE/emails?limit=20" \
+  | jq -r '.emails[] | "\(.id)  \(.from)  \(.subject)\n\(.body // "(no text)")\n---"'
 
-# Download a PDF you saw in the feed (bytes → file). Costs a call, like any other.
+# The real loop. Consumes: each call returns only what is new since the last.
+# 60s is the floor; raise it if /me reports a dailyLimit (86400 / dailyLimit).
+code=$(curl -s -o /tmp/feed.json -w '%{http_code}' -H "$AUTH" "$BASE/emails")
+case "$code" in
+  200) jq -c '.emails[]' /tmp/feed.json | while read -r email; do
+         handle "$email"   # the whole object, body included. Empty output is normal.
+       done ;;
+  429) echo "daily limit reached; resets at 00:00 UTC" ;;
+  401) echo "key invalid or revoked; ask the user to check it"; exit 1 ;;
+  503) echo "transient; retry later" ;;
+esac
+
+# One email's full text
+curl -s -H "$AUTH" "$BASE/emails/$ID" | jq -r '.body'
+
+# One attachment to a file
 curl -s -H "$AUTH" "$BASE/emails/$ID/attachments/$ATTACHMENT_ID" -o invoice.pdf
+```
+
+## Replying and sending
+
+Writing is a separate permission, off by default. `GET /me` tells you where you stand in
+its `send` field:
+
+```jsonc
+"send": {
+  "mode": "drafts_only",                 // or "send"
+  "replyOnly": true,                     // false: POST /emails may start new emails
+  "newRecipients": false,                // true: a reply may cc people who were not on the thread
+  "dailySendCap": null,                  // sends per UTC day, or null; drafts never count
+  "recipientsFromAllowedCategoriesOnly": true,
+  "mailboxEnabled": true,                // false: the user has not turned sending on for the mailbox yet
+  "routes": { "reply": "POST /emails/{id}/reply", "newEmail": "POST /emails", "draft": "POST /drafts" },
+  "howTo": "..."                         // the same rules in a sentence
+}
+```
+
+- **`send: null`**: read only. You cannot draft or send. If the user asks you to answer an
+  email, write the reply text in chat and say sending is outside this key.
+- **`mode: "drafts_only"`**: you write, the user sends. `POST /emails/{id}/reply` with
+  `{ "body": "...", "draft": true }` (or `POST /drafts` with `{ "inReplyTo": id, "body": "..." }`)
+  puts a threaded reply in the user's Drafts folder. Plain `POST /emails/{id}/reply` is
+  refused with `403 SEND_NOT_GRANTED`.
+- **`mode: "send"`**: `POST /emails/{id}/reply` with `{ "body": "..." }` sends the reply from
+  the user's own address, inside the original thread. Add `"replyAll": true` to answer
+  everyone on the thread, `"cc": [...]` for extra people (needs `newRecipients`).
+- **`mailboxEnabled: false`**: every draft and send answers `501` until the user turns
+  sending on for the mailbox in their Thread portal under Connections. Tell them that; do
+  not retry.
+
+Rules that hold regardless of mode:
+
+- **You can only reply to mail you can read.** The original must be in the key's scope;
+  an out-of-scope id is `404`, exactly like a read.
+- **Plain text only.** What you put in `body` is exactly what is sent. No HTML, no
+  attachments on outbound mail in this version.
+- **Show the user the text before you send.** Sending is irreversible and goes out under
+  their name. The sensible default is to draft (or paste the text in chat), get a yes,
+  then send.
+- **Skip your own mail.** A reply you sent comes back through the feed a minute later
+  flagged `"sentByAgent": true`. Never treat it as new inbound mail or answer it.
+- Policy refusals are `403` with a code that says why: `SEND_NOT_GRANTED`,
+  `POLICY_REPLY_ONLY`, `POLICY_NEW_RECIPIENTS`, `POLICY_UNKNOWN_RECIPIENT`. A send cap is
+  `429 SEND_LIMIT_REACHED` (resets at 00:00 UTC). None of these are transient; do not retry
+  them, explain them.
+
+```bash
+# Reply (sends when /me.send.mode is "send"; add "draft": true to save instead)
+curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  "$BASE/emails/$ID/reply" -d '{"body":"Thursday at 3 works for me.\n\nParag"}'
+# → { "id": "…", "threadId": "…", "status": "sent" }      (or "drafted")
 ```
 
 ## What this key can and can't do
 
-Read-only. You always get metadata; you get the body at whatever grade the user
-chose (masked by default, see above), and attachments when granted. It **cannot**
-send, reply, label, archive, delete, or change anything in the mailbox. If the user
-asks you to act on their mail, you can read to decide *what* to do, but the doing is
-outside this key.
-
-It also **cannot receive push**. There is no webhook, no callback, no long-poll for
-an API key — Thread's push delivery exists, but it's for registered third-party apps
-with a callback URL, not for the key you hold. Your loop is the mechanism.
+You always get metadata; you get the text at whatever grade the user chose, and attachments
+when granted. Drafting and sending exist only when `/me.send` says so, and only as far as it
+says. The key can **never** label, archive, delete, or change anything already in the
+mailbox, and it cannot receive push: no webhook, no callback. Your scheduled poll is the
+mechanism.
